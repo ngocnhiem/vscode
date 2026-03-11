@@ -1527,6 +1527,68 @@ begin
   Result := IsWindows11OrLater() and not IsWindows10ContextMenuForced();
 end;
 
+procedure LogContextMenuInstallState();
+begin
+  Log(
+    'Context menu state: '
+    + 'isBackgroundUpdate=' + BoolToStr(IsBackgroundUpdate())
+    + ', isWindows11OrLater=' + BoolToStr(IsWindows11OrLater())
+    + ', isWindows10ContextMenuForced=' + BoolToStr(IsWindows10ContextMenuForced())
+    + ', shouldUseWindows11ContextMenu=' + BoolToStr(ShouldUseWindows11ContextMenu())
+    + ', addcontextmenufiles=' + BoolToStr(WizardIsTaskSelected(''addcontextmenufiles''))
+    + ', addcontextmenufolders=' + BoolToStr(WizardIsTaskSelected(''addcontextmenufolders''))
+  );
+end;
+
+procedure RepairLegacyFolderContextMenuEntriesIfNeeded();
+var
+  FileMenuKey: String;
+  FolderMenuKey: String;
+  FolderBackgroundMenuKey: String;
+  DriveMenuKey: String;
+  HasFileMenuKey: Boolean;
+  HasFolderMenuKey: Boolean;
+  ContextMenuLabel: String;
+  IconValue: String;
+  CommandValue: String;
+begin
+  // Background updates can carry stale task state from previous installs.
+  // If the file context menu exists but folder entries are missing in legacy mode,
+  // restore folder entries to recover from split file/folder task state.
+  if not IsBackgroundUpdate() or ShouldUseWindows11ContextMenu() then
+    exit;
+
+  FileMenuKey := 'Software\Classes\*\shell\{#RegValueName}';
+  FolderMenuKey := 'Software\Classes\directory\shell\{#RegValueName}';
+  FolderBackgroundMenuKey := 'Software\Classes\directory\background\shell\{#RegValueName}';
+  DriveMenuKey := 'Software\Classes\Drive\shell\{#RegValueName}';
+
+  HasFileMenuKey := RegKeyExists({#EnvironmentRootKey}, FileMenuKey);
+  HasFolderMenuKey := RegKeyExists({#EnvironmentRootKey}, FolderMenuKey);
+  Log('Legacy context menu key check: hasFileMenuKey=' + BoolToStr(HasFileMenuKey) + ', hasFolderMenuKey=' + BoolToStr(HasFolderMenuKey));
+
+  if not HasFileMenuKey or HasFolderMenuKey then
+    exit;
+
+  Log('Repairing missing legacy folder context menu entries.');
+
+  ContextMenuLabel := ExpandConstant('{cm:OpenWithCodeContextMenu,{#ShellNameShort}}');
+  IconValue := ExpandConstant('{app}\{#ExeBasename}.exe');
+  CommandValue := AddQuotes(ExpandConstant('{app}\{#ExeBasename}.exe')) + ' "%V"';
+
+  RegWriteExpandStringValue({#EnvironmentRootKey}, FolderMenuKey, '', ContextMenuLabel);
+  RegWriteExpandStringValue({#EnvironmentRootKey}, FolderMenuKey, 'Icon', IconValue);
+  RegWriteExpandStringValue({#EnvironmentRootKey}, FolderMenuKey + '\command', '', CommandValue);
+
+  RegWriteExpandStringValue({#EnvironmentRootKey}, FolderBackgroundMenuKey, '', ContextMenuLabel);
+  RegWriteExpandStringValue({#EnvironmentRootKey}, FolderBackgroundMenuKey, 'Icon', IconValue);
+  RegWriteExpandStringValue({#EnvironmentRootKey}, FolderBackgroundMenuKey + '\command', '', CommandValue);
+
+  RegWriteExpandStringValue({#EnvironmentRootKey}, DriveMenuKey, '', ContextMenuLabel);
+  RegWriteExpandStringValue({#EnvironmentRootKey}, DriveMenuKey, 'Icon', IconValue);
+  RegWriteExpandStringValue({#EnvironmentRootKey}, DriveMenuKey + '\command', '', CommandValue);
+end;
+
 function GetAppMutex(Value: string): string;
 begin
   if IsBackgroundUpdate() then
@@ -1643,21 +1705,32 @@ begin
   if (AppxPackageFullname <> '') then
     Result := True
   else
-    Result := False
+    Result := False;
+
+  Log('Get-AppxPackage result: name=' + name + ', installed=' + BoolToStr(Result) + ', resultCode=' + IntToStr(ResultCode) + ', packageFullName=' + AppxPackageFullname);
 end;
 
 procedure AddAppxPackage();
 var
   AddAppxPackageResultCode: Integer;
+  IsCurrentAppxInstalled: Boolean;
 begin
-  if not SessionEndFileExists() and not AppxPackageInstalled(ExpandConstant('{#AppxPackageName}'), AddAppxPackageResultCode) then begin
+  if SessionEndFileExists() then begin
+    Log('Skipping Add-AppxPackage because session end was detected.');
+    exit;
+  end;
+
+  IsCurrentAppxInstalled := AppxPackageInstalled(ExpandConstant('{#AppxPackageName}'), AddAppxPackageResultCode);
+  if not IsCurrentAppxInstalled then begin
     Log('Installing appx ' + AppxPackageFullname + ' ...');
 #if "user" == InstallTarget
     ShellExec('', 'powershell.exe', '-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command ' + AddQuotes('Add-AppxPackage -Path ''' + ExpandConstant('{app}\{#VersionedResourcesFolder}\appx\{#AppxPackage}') + ''' -ExternalLocation ''' + ExpandConstant('{app}\{#VersionedResourcesFolder}\appx') + ''''), '', SW_HIDE, ewWaitUntilTerminated, AddAppxPackageResultCode);
 #else
     ShellExec('', 'powershell.exe', '-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command ' + AddQuotes('Add-AppxPackage -Stage ''' + ExpandConstant('{app}\{#VersionedResourcesFolder}\appx\{#AppxPackage}') + ''' -ExternalLocation ''' + ExpandConstant('{app}\{#VersionedResourcesFolder}\appx') + '''; Add-AppxProvisionedPackage -Online -SkipLicense -PackagePath ''' + ExpandConstant('{app}\{#VersionedResourcesFolder}\appx\{#AppxPackage}') + ''''), '', SW_HIDE, ewWaitUntilTerminated, AddAppxPackageResultCode);
 #endif
-    Log('Add-AppxPackage complete.');
+    Log('Add-AppxPackage complete with result code ' + IntToStr(AddAppxPackageResultCode) + '.');
+  end else begin
+    Log('Skipping Add-AppxPackage because package is already installed.');
   end;
 end;
 
@@ -1670,6 +1743,7 @@ begin
   if QualityIsInsiders() and not SessionEndFileExists() and AppxPackageInstalled('Microsoft.VSCodeInsiders', RemoveAppxPackageResultCode) then begin
     Log('Deleting old appx ' + AppxPackageFullname + ' installation...');
     ShellExec('', 'powershell.exe', '-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command ' + AddQuotes('Remove-AppxPackage -Package ''' + AppxPackageFullname + ''''), '', SW_HIDE, ewWaitUntilTerminated, RemoveAppxPackageResultCode);
+    Log('Remove-AppxPackage for old appx completed with result code ' + IntToStr(RemoveAppxPackageResultCode) + '.');
     DeleteFile(ExpandConstant('{app}\appx\code_insiders_explorer_{#Arch}.appx'));
     DeleteFile(ExpandConstant('{app}\appx\code_insiders_explorer_command.dll'));
   end;
@@ -1680,7 +1754,9 @@ begin
 #else
     ShellExec('', 'powershell.exe', '-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command ' + AddQuotes('$packages = Get-AppxPackage ''' + ExpandConstant('{#AppxPackageName}') + '''; foreach ($package in $packages) { Remove-AppxProvisionedPackage -PackageName $package.PackageFullName -Online }; foreach ($package in $packages) { Remove-AppxPackage -Package $package.PackageFullName -AllUsers }'), '', SW_HIDE, ewWaitUntilTerminated, RemoveAppxPackageResultCode);
 #endif
-    Log('Remove-AppxPackage for current appx installation complete.');
+    Log('Remove-AppxPackage for current appx installation complete with result code ' + IntToStr(RemoveAppxPackageResultCode) + '.');
+  end else if not SessionEndFileExists() then begin
+    Log('Skipping Remove-AppxPackage for current appx because package is not installed.');
   end;
 end;
 #endif
@@ -1692,6 +1768,9 @@ var
 begin
   if CurStep = ssPostInstall then
   begin
+    LogContextMenuInstallState();
+    RepairLegacyFolderContextMenuEntriesIfNeeded();
+
 #ifdef AppxPackageName
     // Remove the appx package when user has forced Windows 10 context menus via
     // registry. This handles the case where the user previously had the appx
